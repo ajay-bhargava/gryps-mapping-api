@@ -131,3 +131,4 @@ cython_debug/
 
 # Modal
 *.pkl
+*.json

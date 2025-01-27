@@ -1,10 +1,7 @@
 import modal
 from pydantic import BaseModel
-import pickle
-
-# Load credentials from pickle file
-with open("credentials.pkl", "rb") as f:
-    credentials = pickle.load(f)
+import json
+import dotenv
 
 # Define the FastAPI Image
 asgi_image = (
@@ -16,12 +13,13 @@ asgi_image = (
         "pandas",
         "numpy",
         "boto3",
-        "awswrangler"
+        "awswrangler",
+        "python-dotenv"
     )
 )
 
 # Define the Modal App
-app = modal.App("ContechIMSEndpoint")
+app = modal.App("contech-ims-v2")
 
 # Import necessary modules for the FastAPI application
 with asgi_image.imports():
@@ -35,59 +33,105 @@ with asgi_image.imports():
     )
     from utilities.IMSHandler import IMSQueryHandler
     import os
-
+    from fastapi.responses import JSONResponse
 # Request Pydantic Data Model for the endpoint
 class AddressRequest(BaseModel):
     partial_address: str
     city: str
+
+class BinRequest(BaseModel):
+    bin_number: str
 
 # Define the Modal Function to run the FastAPI application
 @app.function(
     image=asgi_image,
     concurrency_limit=1, 
     allow_concurrent_inputs=500,
-    secrets=[modal.Secret.from_dict(credentials)]
+    secrets=[modal.Secret.from_dotenv()]
 )
-@modal.asgi_app(label="ContechIMS")
+@modal.asgi_app(label="contech-ims-v2")
 def endpoint():
     # Define the FastAPI application
-    web_application = FastAPI(title="Contech Hackathon Real Endpoint")
+    web_application = FastAPI(title="Contech IMS V2.0")
+    # Define the credentials for the session
+    CREDENTIALS = {
+        "AccessKeyId": os.environ["AWS_ACCESS_KEY_ID"],
+        "SecretAccessKey": os.environ["AWS_SECRET_ACCESS_KEY"],
+        "Token": os.environ["AWS_SESSION_TOKEN"]
+    }
 
-    # Define the endpoint to get building information
-    @web_application.post("/get_building_info")
-    async def get_building_info(request: AddressRequest):
-        # Define the credentials for the session
-        CREDENTIALS = {
-            "AccessKeyId": os.environ["AccessKeyId"],
-            "SecretAccessKey": os.environ["SecretAccessKey"],
-            "Token": os.environ["Token"]
-        }
 
-        # First, try to get a session from environment variables.
-        session = create_session_with_env_credentials()
+    # First, try to get a session from environment variables.
+    session = create_session_with_env_credentials()
 
-        # If that didn't work (credentials are missing), fallback to a known set.
-        if session.get_credentials() is None:
-            session = create_session_with_credentials(CREDENTIALS)
+    # If that didn't work (credentials are missing), fallback to a known set.
+    if session.get_credentials() is None:
+        session = create_session_with_credentials(CREDENTIALS)
 
-        # Initialize IMS client
-        sql_client = IMSQueryHandler(session=session)
-
+    # Initialize IMS client
+    sql_client = IMSQueryHandler(session=session)
+    # Define the endpoint to get building information    
+    @web_application.get("/get_buildings")
+    async def get_building_location():
         try:
-            # Step 1: Query the building number
             query = f"""
-            SELECT DISTINCT has_inferred_building_number 
-            FROM gryps_neptune.building 
-            WHERE has_address LIKE '%{request.partial_address}%' AND has_city = '{request.city}'
+            SELECT has_address, has_city, has_number FROM gryps_neptune.building
             """
-            uri_results = sql_client.query(query=query, database="gryps_neptune")
-            building_number = uri_results[0]["has_inferred_building_number"]
+            results = pd.DataFrame(sql_client.query(query=query, database="gryps_neptune"))
+            return JSONResponse(content=results.to_dict(orient='records'))
 
-            # Step 2: Query details for the building number
-            query = f"SELECT DISTINCT bin_num, coa_file_link FROM coa_docs WHERE bin_num = {building_number}"
-            results = sql_client.query(query=query, database="dob_bis")
-            return pd.DataFrame(results).to_json()
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
 
+    @web_application.post("/coa_by_bin")
+    async def coa_by_bin(request: BinRequest):
+        try:
+            query = f"""
+            SELECT bin_num, coa_number, coa_file_link FROM coa_docs WHERE bin_num = {request.bin_number}
+            """
+            returned = pd.DataFrame(sql_client.query(query=query, database="dob_bis"))
+            
+            
+            # Convert query results to COA record format and return as JSON
+            coa_data = {
+                "bin_num": request.bin_number,
+                "coa_records": [
+                    {
+                        "coa_number": row["coa_number"],
+                        "coa_file_link": row["coa_file_link"]
+                    }
+                    for _, row in returned.iterrows()
+                ]
+            }
+            
+            return JSONResponse(content=coa_data)
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
+        
+    @web_application.post("/violation_by_bin")
+    async def violation_by_bin(request: BinRequest):
+        try:
+            query = f"""
+            SELECT bin_num, violation_date, violation_link FROM violations_oath WHERE bin_num = {request.bin_number}
+            """
+            returned = pd.DataFrame(sql_client.query(query=query, database="dob_bis"))
+
+            violation_data = {
+                "bin_num": request.bin_number,
+                "violation_records": [
+                    {
+                        "violation_date": int(pd.Timestamp(row["violation_date"]).timestamp()),
+                        "violation_link": row["violation_link"]
+                    }
+                    for _, row in returned.iterrows()
+                ]
+            }
+
+            print(violation_data)
+
+            return JSONResponse(content=violation_data)
+        
         except Exception as e:
             raise HTTPException(status_code=500, detail=str(e))
 
